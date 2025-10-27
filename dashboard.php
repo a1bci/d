@@ -117,7 +117,11 @@ if (isset($_POST['edit_admin'])) {
 // =======================
 // Supervisors data
 // =======================
-$stmtSupervisors = $pdo->query("SELECT * FROM admins ORDER BY id DESC");
+$totalAdminsCount = (int)$pdo->query("SELECT COUNT(*) FROM admins")->fetchColumn();
+$stmtSupervisors = $pdo->prepare("SELECT * FROM admins ORDER BY id DESC LIMIT :offset, :limit");
+$stmtSupervisors->bindValue(':offset', $adminsOffset, PDO::PARAM_INT);
+$stmtSupervisors->bindValue(':limit', $adminsPerPage, PDO::PARAM_INT);
+$stmtSupervisors->execute();
 $supervisors = $stmtSupervisors->fetchAll(PDO::FETCH_ASSOC);
 foreach ($supervisors as &$admin) {
     $aid = (int)$admin['id'];
@@ -130,6 +134,11 @@ foreach ($supervisors as &$admin) {
     $admin['clientCount'] = (int)$stmt->fetchColumn();
 }
 unset($admin);
+
+$adminPages       = (int)max(1, ceil($totalAdminsCount / max($adminsPerPage, 1)));
+$adminShowingFrom = $totalAdminsCount > 0 ? min($totalAdminsCount, $adminsOffset + 1) : 0;
+$adminShowingTo   = $totalAdminsCount > 0 ? min($totalAdminsCount, $adminsOffset + count($supervisors)) : 0;
+if (empty($supervisors)) { $adminShowingFrom = $adminShowingTo = 0; }
 
 // =======================
 // Global stats
@@ -163,9 +172,48 @@ $stmt->execute(); $activeAdmins = (int)$stmt->fetchColumn();
 // =======================
 // OTP Tracking
 // =======================
-$filter_from  = $_GET['from'] ?? date('Y-m-01');
-$filter_to    = $_GET['to']   ?? date('Y-m-d');
+$today = date('Y-m-d');
+$filter_from  = $_GET['from'] ?? $today;
+$filter_to    = $_GET['to']   ?? $today;
 $filter_admin = isset($_GET['admin_id']) && $_GET['admin_id'] !== '' ? (int)$_GET['admin_id'] : null;
+$filter_range = $_GET['range'] ?? (isset($_GET['from']) || isset($_GET['to']) ? 'custom' : 'today');
+
+if ($filter_range !== 'custom') {
+    switch ($filter_range) {
+        case 'today':
+            $filter_from = $today;
+            $filter_to   = $today;
+            break;
+        case '7d':
+            $filter_to   = $_GET['to']   ?? $today;
+            $filter_from = date('Y-m-d', strtotime($filter_to . ' -6 days'));
+            break;
+        case '30d':
+            $filter_to   = $_GET['to']   ?? $today;
+            $filter_from = date('Y-m-d', strtotime($filter_to . ' -29 days'));
+            break;
+        case 'month':
+            $base        = $_GET['to'] ?? $today;
+            $filter_to   = $base;
+            $filter_from = date('Y-m-01', strtotime($base));
+            break;
+        default:
+            $filter_range = 'custom';
+    }
+}
+
+if ($filter_from > $filter_to) {
+    [$filter_from, $filter_to] = [$filter_to, $filter_from];
+}
+
+$otpPage    = max(1, (int)($_GET['otp_page'] ?? 1));
+$otpPerPage = 20;
+$otpOffset  = ($otpPage - 1) * $otpPerPage;
+
+$currentAdminPage = isset($_POST['admin_page']) ? (int)$_POST['admin_page'] : (int)($_GET['admin_page'] ?? 1);
+if ($currentAdminPage < 1) { $currentAdminPage = 1; }
+$adminsPerPage = 8;
+$adminsOffset  = ($currentAdminPage - 1) * $adminsPerPage;
 
 // Export CSV
 if (isset($_GET['export']) && $_GET['export']==='otp') {
@@ -240,9 +288,20 @@ $sql = "SELECT l.id, l.client_id, l.admin_id, l.code, l.created_at,
         LEFT JOIN admins a  ON a.id = l.admin_id
         WHERE DATE(l.created_at) BETWEEN :f AND :t";
 if ($filter_admin !== null) { $sql .= " AND l.admin_id = :ad"; }
-$sql .= " ORDER BY l.created_at DESC LIMIT 100";
-$stmt = $pdo->prepare($sql); $stmt->execute($params);
+$sql .= " ORDER BY l.created_at DESC LIMIT :offset, :limit";
+$stmt = $pdo->prepare($sql);
+$stmt->bindValue(':f', $params[':f']);
+$stmt->bindValue(':t', $params[':t']);
+if ($filter_admin !== null) { $stmt->bindValue(':ad', $params[':ad'], PDO::PARAM_INT); }
+$stmt->bindValue(':offset', $otpOffset, PDO::PARAM_INT);
+$stmt->bindValue(':limit', $otpPerPage, PDO::PARAM_INT);
+$stmt->execute();
 $otpRecent = $stmt->fetchAll(PDO::FETCH_ASSOC);
+
+$otpPages       = (int)max(1, ceil($otpTotalInRange / max($otpPerPage, 1)));
+$otpShowingFrom = $otpTotalInRange > 0 ? min($otpTotalInRange, $otpOffset + 1) : 0;
+$otpShowingTo   = $otpTotalInRange > 0 ? min($otpTotalInRange, $otpOffset + count($otpRecent)) : 0;
+if (empty($otpRecent)) { $otpShowingFrom = $otpShowingTo = 0; }
 
 // Admins list for filters
 $adminsList = $pdo->query("SELECT id, username FROM admins ORDER BY username ASC")->fetchAll(PDO::FETCH_ASSOC);
@@ -267,6 +326,14 @@ $topClientLeaders = $pdo->query("SELECT a.id, a.username, COUNT(c.id) AS total_c
 
 $otpDailyAverage = !empty($chartCounts) ? round(array_sum($chartCounts) / max(count($chartCounts), 1), 1) : 0;
 $latestOtp = $otpRecent[0] ?? null;
+
+function buildQuery(array $base, array $updates = [], array $remove = []): string
+{
+    foreach ($remove as $key) {
+        unset($base[$key]);
+    }
+    return http_build_query(array_merge($base, $updates));
+}
 
 function shortNumber($number)
 {
@@ -360,6 +427,15 @@ function formatRelativeTime(?string $datetime): string
   .table-actions{display:flex; flex-wrap:wrap; gap:8px; align-items:center;}
   .action-btn{display:inline-flex; align-items:center; gap:6px; border-radius:999px; padding:6px 14px; border:1px solid var(--hair); font-size:12px;}
   .action-btn.primary{background:#111827; color:#fff; border-color:#111827;}
+  @media (max-width:768px){
+    body{background:#f9f9fb;}
+    .panel{border-radius:18px; padding:20px;}
+    .card{border-radius:18px;}
+    .stat-card{padding:18px; border-radius:18px;}
+    .hero{padding:24px 18px;}
+    .table-surface table{min-width:640px;}
+    main{padding-bottom:28px;}
+  }
 </style>
 </head>
 <body>
@@ -401,21 +477,33 @@ function formatRelativeTime(?string $datetime): string
   </div>
 </aside>
 
+<!-- MOBILE HEADER -->
+<header class="md:hidden sticky top-0 z-30 bg-[#111827] text-white px-4 py-4 flex items-center justify-between">
+  <div>
+    <div class="text-xs text-gray-300">مرحباً</div>
+    <div class="font-semibold text-lg"><?= htmlspecialchars($superAdminUsername) ?></div>
+  </div>
+  <div class="text-xs text-gray-300 text-right">
+    <div><?= date('Y-m-d') ?></div>
+    <div><?= date('H:i') ?></div>
+  </div>
+</header>
+
 <!-- MAIN -->
-<main class="md:pr-80 p-4 md:p-8 space-y-10">
+<main class="md:pr-80 p-4 md:p-8 space-y-10 pt-20 md:pt-8 max-w-7xl mx-auto">
 
   <section class="panel hero soft round p-6 lg:p-8">
     <div class="grid gap-6 lg:grid-cols-[1.6fr,1fr] items-center relative">
       <div class="space-y-4 relative z-10">
         <span class="badge-soft"><i class="fa-solid fa-gauge-high text-sm"></i> لوحة التحكم المتقدمة</span>
-        <h1 class="text-3xl md:text-4xl font-bold text-gray-900 leading-tight">كل ما تحتاجه لإدارة المنصة في صفحة واحدة</h1>
+        <h1 class="text-2xl sm:text-3xl md:text-4xl font-bold text-gray-900 leading-tight">كل ما تحتاجه لإدارة المنصة في صفحة واحدة</h1>
         <p class="text-gray-600 leading-relaxed">راقب أداء العملاء، فعالية المشرفين، وسجلات OTP من واجهة واحدة أنيقة. تم تصميم هذه اللوحة لتوفر لك السرعة في اتخاذ القرار والوضوح في البيانات.</p>
         <div class="flex flex-wrap gap-3">
           <a href="#admins" class="pill px-5 py-2 bg-black text-white flex items-center gap-2">
             <i class="fa-solid fa-users-gear text-sm"></i>
             إدارة المشرفين
           </a>
-          <a href="?export=otp&from=<?= urlencode($filter_from) ?>&to=<?= urlencode($filter_to) ?><?= $filter_admin!==null ? '&admin_id='.$filter_admin : '' ?>" class="action-btn primary">
+          <a href="?<?= htmlspecialchars(buildQuery($_GET, ['export' => 'otp'], ['otp_page'])) ?>" class="action-btn primary">
             <i class="fa-solid fa-file-arrow-down text-sm"></i>
             تصدير OTP
           </a>
@@ -608,6 +696,7 @@ function formatRelativeTime(?string $datetime): string
       <span class="badge-soft"><i class="fa-regular fa-clock"></i> آخر تحديث <?= date('H:i') ?></span>
     </div>
     <form method="GET" class="grid gap-3 md:grid-cols-5">
+      <input type="hidden" name="range" id="rangeInput" value="<?= htmlspecialchars($filter_range) ?>">
       <div>
         <label class="text-xs muted mb-1 block">من</label>
         <input type="date" name="from" value="<?= htmlspecialchars($filter_from) ?>" class="w-full chip px-3 py-2 round">
@@ -629,7 +718,24 @@ function formatRelativeTime(?string $datetime): string
         <button class="w-full pill px-4 py-2 bg-black text-white">تطبيق</button>
       </div>
       <div class="flex items-end">
-        <a href="?export=otp&from=<?= urlencode($filter_from) ?>&to=<?= urlencode($filter_to) ?><?= $filter_admin!==null ? '&admin_id='.$filter_admin : '' ?>" class="w-full pill px-4 py-2 bg-white text-gray-700 border border-gray-200 text-center">تحميل CSV</a>
+        <a href="?<?= htmlspecialchars(buildQuery($_GET, ['export' => 'otp'], ['otp_page'])) ?>" class="w-full pill px-4 py-2 bg-white text-gray-700 border border-gray-200 text-center">تحميل CSV</a>
+      </div>
+      <div class="md:col-span-5 flex flex-wrap gap-2 items-center text-xs text-gray-500">
+        <span class="muted">نطاق سريع:</span>
+        <?php
+          $rangeOptions = [
+            'today' => 'اليوم',
+            '7d'    => 'آخر 7 أيام',
+            '30d'   => 'آخر 30 يوماً',
+            'month' => 'بداية الشهر'
+          ];
+        ?>
+        <?php foreach ($rangeOptions as $value => $label): ?>
+          <button type="button" class="chip px-3 py-1 round quick-range <?= $filter_range === $value ? 'bg-black text-white border-black' : '' ?>" data-range="<?= $value ?>">
+            <?= $label ?>
+          </button>
+        <?php endforeach; ?>
+        <button type="button" class="chip px-3 py-1 round <?= $filter_range === 'custom' ? 'bg-black text-white border-black' : '' ?>" id="customRangeBtn">مخصص</button>
       </div>
     </form>
     <div class="grid grid-cols-2 md:grid-cols-4 gap-3">
@@ -652,7 +758,13 @@ function formatRelativeTime(?string $datetime): string
     </div>
     <div class="table-surface overflow-x-auto">
       <div class="flex items-center justify-between px-4 py-3">
-        <div class="font-semibold">آخر 100 عملية</div>
+        <div class="text-sm text-gray-600">
+          <?php if ($otpTotalInRange > 0): ?>
+            عرض <?= number_format($otpShowingFrom) ?>-<?= number_format($otpShowingTo) ?> من <?= number_format($otpTotalInRange) ?>
+          <?php else: ?>
+            لا توجد نتائج للعرض
+          <?php endif; ?>
+        </div>
         <input id="otpSearch" class="chip round px-3 py-2 w-60" placeholder="بحث سريع...">
       </div>
       <table>
@@ -698,6 +810,23 @@ function formatRelativeTime(?string $datetime): string
         </tbody>
       </table>
     </div>
+    <?php if ($otpPages > 1): ?>
+      <?php $otpWindowStart = max(1, $otpPage - 2); $otpWindowEnd = min($otpPages, $otpPage + 2); ?>
+      <div class="flex flex-wrap items-center justify-between gap-3 text-sm text-gray-600">
+        <div>صفحة <?= number_format($otpPage) ?> من <?= number_format($otpPages) ?></div>
+        <div class="flex items-center gap-2">
+          <?php if ($otpPage > 1): ?>
+            <a class="chip px-3 py-1 round" href="?<?= htmlspecialchars(buildQuery($_GET, ['otp_page' => $otpPage - 1], ['export'])) ?>">السابق</a>
+          <?php endif; ?>
+          <?php for ($p = $otpWindowStart; $p <= $otpWindowEnd; $p++): ?>
+            <a class="chip px-3 py-1 round <?= $p === $otpPage ? 'bg-black text-white border-black' : '' ?>" href="?<?= htmlspecialchars(buildQuery($_GET, ['otp_page' => $p], ['export'])) ?>"><?= number_format($p) ?></a>
+          <?php endfor; ?>
+          <?php if ($otpPage < $otpPages): ?>
+            <a class="chip px-3 py-1 round" href="?<?= htmlspecialchars(buildQuery($_GET, ['otp_page' => $otpPage + 1], ['export'])) ?>">التالي</a>
+          <?php endif; ?>
+        </div>
+      </div>
+    <?php endif; ?>
   </section>
 
   <section id="admins" class="space-y-6">
@@ -723,6 +852,7 @@ function formatRelativeTime(?string $datetime): string
           </div>
           <form method="POST" class="space-y-3">
             <input type="hidden" name="csrf_token" value="<?= htmlspecialchars($_SESSION['csrf_token'], ENT_QUOTES, 'UTF-8') ?>">
+            <input type="hidden" name="admin_page" value="<?= $currentAdminPage ?>">
             <div class="space-y-1">
               <label class="text-xs muted">اسم المستخدم</label>
               <input type="text" name="username" placeholder="اسم المستخدم" required class="chip round px-3 py-2 w-full">
@@ -742,6 +872,16 @@ function formatRelativeTime(?string $datetime): string
           </form>
         </div>
         <div class="table-surface card round soft p-0 overflow-hidden">
+          <div class="flex items-center justify-between px-4 py-3 border-b border-gray-100 text-sm text-gray-600">
+            <div>
+              <?php if ($totalAdminsCount > 0): ?>
+                عرض <?= number_format($adminShowingFrom) ?>-<?= number_format($adminShowingTo) ?> من <?= number_format($totalAdminsCount) ?> مشرف
+              <?php else: ?>
+                لا يوجد مشرفون بعد
+              <?php endif; ?>
+            </div>
+            <div class="hidden sm:block text-xs text-gray-400">صفحة <?= number_format($currentAdminPage) ?> من <?= number_format($adminPages) ?></div>
+          </div>
           <table>
             <thead>
               <tr>
@@ -770,14 +910,14 @@ function formatRelativeTime(?string $datetime): string
                       }
                   }
                 ?>
-                <tr class="hover:bg-gray-50">
+                <tr class="hover:bg-gray-50" data-admin-row="<?= (int)$admin['id'] ?>">
                   <td>
                     <div class="flex flex-col gap-1">
                       <div class="flex items-center gap-2 flex-wrap">
-                        <span class="font-semibold text-gray-800"><?= htmlspecialchars($admin['username']) ?></span>
+                        <span class="font-semibold text-gray-800 admin-username"><?= htmlspecialchars($admin['username']) ?></span>
                         <span class="<?= $badge ?> text-xs px-3 py-1"><?= $statusText ?></span>
                       </div>
-                      <span class="text-xs text-gray-500">الانتهاء: <?= htmlspecialchars($admin['expiry_date'] ?? 'غير محدد') ?></span>
+                      <span class="text-xs text-gray-500 admin-expiry">الانتهاء: <?= htmlspecialchars($admin['expiry_date'] ?? 'غير محدد') ?></span>
                     </div>
                   </td>
                   <td class="text-center font-semibold text-gray-800"><?= number_format((int)$admin['clientCount']) ?></td>
@@ -800,6 +940,7 @@ function formatRelativeTime(?string $datetime): string
                         <form method="POST" onsubmit="return confirm('تأكيد الحذف؟')">
                           <input type="hidden" name="admin_id" value="<?= (int)$admin['id'] ?>">
                           <input type="hidden" name="csrf_token" value="<?= htmlspecialchars($_SESSION['csrf_token'], ENT_QUOTES, 'UTF-8') ?>">
+                          <input type="hidden" name="admin_page" value="<?= $currentAdminPage ?>">
                           <button type="submit" name="delete_admin" class="action-btn">
                             <i class="fa-regular fa-trash-can"></i>
                             حذف
@@ -809,6 +950,7 @@ function formatRelativeTime(?string $datetime): string
                           <input type="hidden" name="admin_id" value="<?= (int)$admin['id'] ?>">
                           <input type="hidden" name="is_active" value="<?= $admin['is_active']?0:1 ?>">
                           <input type="hidden" name="csrf_token" value="<?= htmlspecialchars($_SESSION['csrf_token'], ENT_QUOTES, 'UTF-8') ?>">
+                          <input type="hidden" name="admin_page" value="<?= $currentAdminPage ?>">
                           <button type="submit" name="toggle_status" class="action-btn">
                             <i class="fa-solid fa-power-off"></i>
                             <?= $admin['is_active']?'إيقاف':'تنشيط' ?>
@@ -834,6 +976,23 @@ function formatRelativeTime(?string $datetime): string
           </table>
         </div>
       </div>
+      <?php if ($adminPages > 1): ?>
+        <?php $adminWindowStart = max(1, $currentAdminPage - 2); $adminWindowEnd = min($adminPages, $currentAdminPage + 2); ?>
+        <div class="flex flex-wrap items-center justify-between gap-3 text-sm text-gray-600">
+          <div>صفحة <?= number_format($currentAdminPage) ?> من <?= number_format($adminPages) ?></div>
+          <div class="flex items-center gap-2">
+            <?php if ($currentAdminPage > 1): ?>
+              <a class="chip px-3 py-1 round" href="?<?= htmlspecialchars(buildQuery($_GET, ['admin_page' => $currentAdminPage - 1], ['export'])) ?>#admins">السابق</a>
+            <?php endif; ?>
+            <?php for ($p = $adminWindowStart; $p <= $adminWindowEnd; $p++): ?>
+              <a class="chip px-3 py-1 round <?= $p === $currentAdminPage ? 'bg-black text-white border-black' : '' ?>" href="?<?= htmlspecialchars(buildQuery($_GET, ['admin_page' => $p], ['export'])) ?>#admins"><?= number_format($p) ?></a>
+            <?php endfor; ?>
+            <?php if ($currentAdminPage < $adminPages): ?>
+              <a class="chip px-3 py-1 round" href="?<?= htmlspecialchars(buildQuery($_GET, ['admin_page' => $currentAdminPage + 1], ['export'])) ?>#admins">التالي</a>
+            <?php endif; ?>
+          </div>
+        </div>
+      <?php endif; ?>
     </div>
   </section>
 
@@ -852,6 +1011,7 @@ function formatRelativeTime(?string $datetime): string
           <label class="text-xs muted" for="editExpiryDate">تاريخ الانتهاء</label>
           <input type="date" name="expiry_date" id="editExpiryDate" class="chip round px-3 py-2 w-full">
         </div>
+        <div id="editFeedback" class="hidden text-xs"></div>
         <div class="flex justify-end gap-2">
           <button type="button" id="closeModal" class="chip round px-4 py-2">إلغاء</button>
           <button type="submit" name="edit_admin" class="pill px-4 py-2 bg-black text-white">حفظ</button>
@@ -869,16 +1029,70 @@ function formatRelativeTime(?string $datetime): string
   // Modal
   const modal = document.getElementById('editAdminModal');
   const closeModalBtn = document.getElementById('closeModal');
+  const editForm = document.getElementById('editAdminForm');
+  const editFeedback = document.getElementById('editFeedback');
   document.querySelectorAll('.edit-admin').forEach(btn=>{
     btn.addEventListener('click',()=>{
       document.getElementById('editAdminId').value = btn.dataset.id;
       document.getElementById('editUsername').value = btn.dataset.username || '';
       document.getElementById('editExpiryDate').value = btn.dataset.expiry || '';
+      if(editFeedback){ editFeedback.className = 'hidden text-xs'; editFeedback.textContent=''; }
       modal.classList.remove('hidden'); modal.classList.add('flex');
     });
   });
   closeModalBtn && closeModalBtn.addEventListener('click',()=>{ modal.classList.add('hidden'); modal.classList.remove('flex'); });
   modal && modal.addEventListener('click',(e)=>{ if(e.target===modal){ closeModalBtn.click(); } });
+
+  editForm?.addEventListener('submit', async (event)=>{
+    event.preventDefault();
+    const formData = new FormData(editForm);
+    formData.append('edit_admin', '1');
+    const submitBtn = editForm.querySelector('button[type="submit"]');
+    const originalText = submitBtn?.innerHTML;
+    if(submitBtn){ submitBtn.disabled = true; submitBtn.textContent = 'جاري الحفظ...'; }
+    if(editFeedback){ editFeedback.className = 'hidden text-xs'; editFeedback.textContent=''; }
+    let responseData = null;
+    try {
+      const response = await fetch(window.location.href, { method:'POST', body: formData });
+      const contentType = response.headers.get('content-type') || '';
+      if (contentType.includes('application/json')) {
+        responseData = await response.json();
+      }
+      if (!response.ok) {
+        throw new Error('request-failed');
+      }
+    } catch (err) {
+      responseData = responseData || { status: 'error', message: 'حدث خطأ غير متوقع. حاول مجدداً.' };
+    }
+    const username = (editForm.querySelector('#editUsername')?.value || '').trim();
+    const expiryValue = editForm.querySelector('#editExpiryDate')?.value || '';
+    const adminId = formData.get('admin_id');
+    if(responseData?.status === 'success'){
+      if(editFeedback){
+        editFeedback.className = 'block text-xs mt-2 px-3 py-2 round bg-emerald-50 text-emerald-700 border border-emerald-200';
+        editFeedback.textContent = responseData.message || 'تم الحفظ بنجاح.';
+      }
+      const targetRow = document.querySelector(`[data-admin-row="${adminId}"]`);
+      if(targetRow){
+        const usernameCell = targetRow.querySelector('.admin-username');
+        const expiryCell = targetRow.querySelector('.admin-expiry');
+        if(usernameCell){ usernameCell.textContent = username; }
+        if(expiryCell){ expiryCell.textContent = 'الانتهاء: ' + (expiryValue || 'غير محدد'); }
+      }
+      const triggerBtn = document.querySelector(`.edit-admin[data-id="${adminId}"]`);
+      if(triggerBtn){
+        triggerBtn.dataset.username = username;
+        triggerBtn.dataset.expiry = expiryValue;
+      }
+      setTimeout(()=>{ closeModalBtn?.click(); }, 900);
+    } else {
+      if(editFeedback){
+        editFeedback.className = 'block text-xs mt-2 px-3 py-2 round bg-rose-50 text-rose-700 border border-rose-200';
+        editFeedback.textContent = responseData?.message || 'تعذر حفظ التغييرات.';
+      }
+    }
+    if(submitBtn){ submitBtn.disabled = false; submitBtn.innerHTML = originalText || 'حفظ'; }
+  });
 
   // Table search
   const otpSearch = document.getElementById('otpSearch');
@@ -889,6 +1103,54 @@ function formatRelativeTime(?string $datetime): string
       const text = tr.innerText.toLowerCase();
       tr.style.display = text.includes(q) ? '' : 'none';
     });
+  });
+
+  // Quick date ranges
+  const rangeInput = document.getElementById('rangeInput');
+  const fromInput = document.querySelector('input[name="from"]');
+  const toInput = document.querySelector('input[name="to"]');
+  const quickRangeButtons = document.querySelectorAll('.quick-range');
+  const customRangeBtn = document.getElementById('customRangeBtn');
+  const formatDateValue = (date)=>{
+    const year = date.getFullYear();
+    const month = String(date.getMonth() + 1).padStart(2,'0');
+    const day = String(date.getDate()).padStart(2,'0');
+    return `${year}-${month}-${day}`;
+  };
+  quickRangeButtons.forEach(btn=>{
+    btn.addEventListener('click', ()=>{
+      const range = btn.dataset.range || 'today';
+      const form = btn.closest('form');
+      const baseDate = toInput?.value ? new Date(`${toInput.value}T00:00:00`) : new Date();
+      let startDate = new Date(baseDate);
+      switch(range){
+        case '7d':
+          startDate.setDate(startDate.getDate() - 6);
+          break;
+        case '30d':
+          startDate.setDate(startDate.getDate() - 29);
+          break;
+        case 'month':
+          startDate = new Date(baseDate.getFullYear(), baseDate.getMonth(), 1);
+          break;
+        default:
+          startDate = new Date(baseDate.getFullYear(), baseDate.getMonth(), baseDate.getDate());
+      }
+      if(fromInput){ fromInput.value = formatDateValue(startDate); }
+      if(toInput){ toInput.value = formatDateValue(baseDate); }
+      if(rangeInput){ rangeInput.value = range; }
+      if(form){
+        if(typeof form.requestSubmit === 'function'){
+          form.requestSubmit();
+        } else {
+          form.submit();
+        }
+      }
+    });
+  });
+  customRangeBtn?.addEventListener('click', ()=>{ if(rangeInput){ rangeInput.value = 'custom'; } });
+  [fromInput, toInput].forEach(el=>{
+    el?.addEventListener('change', ()=>{ if(rangeInput){ rangeInput.value = 'custom'; } });
   });
 
   // Charts
