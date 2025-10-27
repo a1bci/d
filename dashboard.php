@@ -117,6 +117,11 @@ if (isset($_POST['edit_admin'])) {
 // =======================
 // Supervisors data
 // =======================
+$currentAdminPage = isset($_POST['admin_page']) ? (int)$_POST['admin_page'] : (int)($_GET['admin_page'] ?? 1);
+if ($currentAdminPage < 1) { $currentAdminPage = 1; }
+$adminsPerPage = 8;
+$adminsOffset  = ($currentAdminPage - 1) * $adminsPerPage;
+
 $totalAdminsCount = (int)$pdo->query("SELECT COUNT(*) FROM admins")->fetchColumn();
 $stmtSupervisors = $pdo->prepare("SELECT * FROM admins ORDER BY id DESC LIMIT :offset, :limit");
 $stmtSupervisors->bindValue(':offset', $adminsOffset, PDO::PARAM_INT);
@@ -209,11 +214,6 @@ if ($filter_from > $filter_to) {
 $otpPage    = max(1, (int)($_GET['otp_page'] ?? 1));
 $otpPerPage = 20;
 $otpOffset  = ($otpPage - 1) * $otpPerPage;
-
-$currentAdminPage = isset($_POST['admin_page']) ? (int)$_POST['admin_page'] : (int)($_GET['admin_page'] ?? 1);
-if ($currentAdminPage < 1) { $currentAdminPage = 1; }
-$adminsPerPage = 8;
-$adminsOffset  = ($currentAdminPage - 1) * $adminsPerPage;
 
 // Export CSV
 if (isset($_GET['export']) && $_GET['export']==='otp') {
