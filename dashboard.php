@@ -117,7 +117,16 @@ if (isset($_POST['edit_admin'])) {
 // =======================
 // Supervisors data
 // =======================
-$stmtSupervisors = $pdo->query("SELECT * FROM admins ORDER BY id DESC");
+$currentAdminPage = isset($_POST['admin_page']) ? (int)$_POST['admin_page'] : (int)($_GET['admin_page'] ?? 1);
+if ($currentAdminPage < 1) { $currentAdminPage = 1; }
+$adminsPerPage = 8;
+$adminsOffset  = ($currentAdminPage - 1) * $adminsPerPage;
+
+$totalAdminsCount = (int)$pdo->query("SELECT COUNT(*) FROM admins")->fetchColumn();
+$stmtSupervisors = $pdo->prepare("SELECT * FROM admins ORDER BY id DESC LIMIT :offset, :limit");
+$stmtSupervisors->bindValue(':offset', $adminsOffset, PDO::PARAM_INT);
+$stmtSupervisors->bindValue(':limit', $adminsPerPage, PDO::PARAM_INT);
+$stmtSupervisors->execute();
 $supervisors = $stmtSupervisors->fetchAll(PDO::FETCH_ASSOC);
 foreach ($supervisors as &$admin) {
     $aid = (int)$admin['id'];
@@ -130,6 +139,11 @@ foreach ($supervisors as &$admin) {
     $admin['clientCount'] = (int)$stmt->fetchColumn();
 }
 unset($admin);
+
+$adminPages       = (int)max(1, ceil($totalAdminsCount / max($adminsPerPage, 1)));
+$adminShowingFrom = $totalAdminsCount > 0 ? min($totalAdminsCount, $adminsOffset + 1) : 0;
+$adminShowingTo   = $totalAdminsCount > 0 ? min($totalAdminsCount, $adminsOffset + count($supervisors)) : 0;
+if (empty($supervisors)) { $adminShowingFrom = $adminShowingTo = 0; }
 
 // =======================
 // Global stats
@@ -163,9 +177,43 @@ $stmt->execute(); $activeAdmins = (int)$stmt->fetchColumn();
 // =======================
 // OTP Tracking
 // =======================
-$filter_from  = $_GET['from'] ?? date('Y-m-01');
-$filter_to    = $_GET['to']   ?? date('Y-m-d');
+$today = date('Y-m-d');
+$filter_from  = $_GET['from'] ?? $today;
+$filter_to    = $_GET['to']   ?? $today;
 $filter_admin = isset($_GET['admin_id']) && $_GET['admin_id'] !== '' ? (int)$_GET['admin_id'] : null;
+$filter_range = $_GET['range'] ?? (isset($_GET['from']) || isset($_GET['to']) ? 'custom' : 'today');
+
+if ($filter_range !== 'custom') {
+    switch ($filter_range) {
+        case 'today':
+            $filter_from = $today;
+            $filter_to   = $today;
+            break;
+        case '7d':
+            $filter_to   = $_GET['to']   ?? $today;
+            $filter_from = date('Y-m-d', strtotime($filter_to . ' -6 days'));
+            break;
+        case '30d':
+            $filter_to   = $_GET['to']   ?? $today;
+            $filter_from = date('Y-m-d', strtotime($filter_to . ' -29 days'));
+            break;
+        case 'month':
+            $base        = $_GET['to'] ?? $today;
+            $filter_to   = $base;
+            $filter_from = date('Y-m-01', strtotime($base));
+            break;
+        default:
+            $filter_range = 'custom';
+    }
+}
+
+if ($filter_from > $filter_to) {
+    [$filter_from, $filter_to] = [$filter_to, $filter_from];
+}
+
+$otpPage    = max(1, (int)($_GET['otp_page'] ?? 1));
+$otpPerPage = 20;
+$otpOffset  = ($otpPage - 1) * $otpPerPage;
 
 // Export CSV
 if (isset($_GET['export']) && $_GET['export']==='otp') {
@@ -240,12 +288,92 @@ $sql = "SELECT l.id, l.client_id, l.admin_id, l.code, l.created_at,
         LEFT JOIN admins a  ON a.id = l.admin_id
         WHERE DATE(l.created_at) BETWEEN :f AND :t";
 if ($filter_admin !== null) { $sql .= " AND l.admin_id = :ad"; }
-$sql .= " ORDER BY l.created_at DESC LIMIT 100";
-$stmt = $pdo->prepare($sql); $stmt->execute($params);
+$sql .= " ORDER BY l.created_at DESC LIMIT :offset, :limit";
+$stmt = $pdo->prepare($sql);
+$stmt->bindValue(':f', $params[':f']);
+$stmt->bindValue(':t', $params[':t']);
+if ($filter_admin !== null) { $stmt->bindValue(':ad', $params[':ad'], PDO::PARAM_INT); }
+$stmt->bindValue(':offset', $otpOffset, PDO::PARAM_INT);
+$stmt->bindValue(':limit', $otpPerPage, PDO::PARAM_INT);
+$stmt->execute();
 $otpRecent = $stmt->fetchAll(PDO::FETCH_ASSOC);
+
+$otpPages       = (int)max(1, ceil($otpTotalInRange / max($otpPerPage, 1)));
+$otpShowingFrom = $otpTotalInRange > 0 ? min($otpTotalInRange, $otpOffset + 1) : 0;
+$otpShowingTo   = $otpTotalInRange > 0 ? min($otpTotalInRange, $otpOffset + count($otpRecent)) : 0;
+if (empty($otpRecent)) { $otpShowingFrom = $otpShowingTo = 0; }
 
 // Admins list for filters
 $adminsList = $pdo->query("SELECT id, username FROM admins ORDER BY username ASC")->fetchAll(PDO::FETCH_ASSOC);
+
+// =======================
+// Enhanced insights data
+// =======================
+$stmt = $pdo->prepare("SELECT c.id, c.username, c.admin_id, c.created_at, a.username AS admin_name
+                       FROM clients c
+                       LEFT JOIN admins a ON a.id = c.admin_id
+                       ORDER BY c.created_at DESC
+                       LIMIT 8");
+$stmt->execute();
+$recentClients = $stmt->fetchAll(PDO::FETCH_ASSOC);
+
+$topClientLeaders = $pdo->query("SELECT a.id, a.username, COUNT(c.id) AS total_clients
+                                 FROM admins a
+                                 LEFT JOIN clients c ON c.admin_id = a.id
+                                 GROUP BY a.id, a.username
+                                 ORDER BY total_clients DESC
+                                 LIMIT 5")->fetchAll(PDO::FETCH_ASSOC);
+
+$otpDailyAverage = !empty($chartCounts) ? round(array_sum($chartCounts) / max(count($chartCounts), 1), 1) : 0;
+$latestOtp = $otpRecent[0] ?? null;
+
+function buildQuery(array $base, array $updates = [], array $remove = []): string
+{
+    foreach ($remove as $key) {
+        unset($base[$key]);
+    }
+    return http_build_query(array_merge($base, $updates));
+}
+
+function shortNumber($number)
+{
+    $number = (int)$number;
+    if ($number >= 1000000) {
+        return round($number / 1000000, 1) . ' م';
+    }
+    if ($number >= 1000) {
+        return round($number / 1000, 1) . ' ألف';
+    }
+    return number_format($number);
+}
+
+function formatRelativeTime(?string $datetime): string
+{
+    if (!$datetime) {
+        return 'غير متوفر';
+    }
+    $timestamp = strtotime($datetime);
+    if (!$timestamp) {
+        return htmlspecialchars($datetime, ENT_QUOTES, 'UTF-8');
+    }
+    $diff = time() - $timestamp;
+    if ($diff < 60) {
+        return 'الآن';
+    }
+    if ($diff < 3600) {
+        $minutes = max(1, floor($diff / 60));
+        return 'قبل ' . $minutes . ' دقيقة';
+    }
+    if ($diff < 86400) {
+        $hours = max(1, floor($diff / 3600));
+        return 'قبل ' . $hours . ' ساعة';
+    }
+    if ($diff < 604800) {
+        $days = max(1, floor($diff / 86400));
+        return 'قبل ' . $days . ' يوم';
+    }
+    return date('Y-m-d H:i', $timestamp);
+}
 ?>
 <!doctype html>
 <html lang="ar" dir="rtl">
@@ -281,6 +409,33 @@ $adminsList = $pdo->query("SELECT id, username FROM admins ORDER BY username ASC
   .sidebar{background:#111827; color:#e5e7eb}
   .icon-btn{background:#0f172a; color:#e5e7eb; border:1px solid rgba(255,255,255,.06)}
   .muted{color:var(--muted)}
+  .hero{position:relative; overflow:hidden;}
+  .hero::after{content:''; position:absolute; right:-40px; left:-40px; bottom:-60px; height:180px; background:radial-gradient(circle at center,var(--grad2),transparent 70%); opacity:.6;}
+  .stat-card{background:var(--panel); border:1px solid var(--hair); border-radius:20px; padding:20px; box-shadow:0 10px 22px rgba(15,23,42,.06); display:flex; flex-direction:column; gap:12px;}
+  .stat-icon{width:40px; height:40px; border-radius:14px; display:grid; place-items:center; font-size:18px;}
+  .stat-value{font-size:28px; font-weight:700; color:var(--ink);}
+  .badge-soft{border-radius:999px; border:1px solid rgba(17,24,39,.08); background:rgba(249,250,251,.75); padding:4px 10px; font-size:12px; color:#4b5563; display:inline-flex; align-items:center; gap:6px;}
+  .glass{background:rgba(255,255,255,.65); border:1px solid rgba(255,255,255,.4); box-shadow:0 16px 40px rgba(15,23,42,.08); backdrop-filter:blur(18px);}
+  .list-tile{display:flex; justify-content:space-between; align-items:center; padding:14px 0; border-bottom:1px solid var(--hair);}
+  .list-tile:last-child{border-bottom:none;}
+  .timeline-row{display:grid; grid-template-columns:auto 1fr; gap:16px; padding:12px 0; border-bottom:1px solid var(--hair);}
+  .timeline-row:last-child{border-bottom:none;}
+  .timeline-dot{width:14px; height:14px; border-radius:50%; background:linear-gradient(135deg,var(--grad3),var(--grad4)); position:relative; top:6px; box-shadow:0 0 0 4px rgba(161,140,209,.18);}
+  .table-surface table{width:100%; border-collapse:separate; border-spacing:0;}
+  .table-surface thead th{background:var(--chip); color:#6b7280; font-size:12px; font-weight:600; padding:12px; text-align:right;}
+  .table-surface tbody td{padding:16px 12px; border-bottom:1px solid var(--hair); font-size:14px;}
+  .table-actions{display:flex; flex-wrap:wrap; gap:8px; align-items:center;}
+  .action-btn{display:inline-flex; align-items:center; gap:6px; border-radius:999px; padding:6px 14px; border:1px solid var(--hair); font-size:12px;}
+  .action-btn.primary{background:#111827; color:#fff; border-color:#111827;}
+  @media (max-width:768px){
+    body{background:#f9f9fb;}
+    .panel{border-radius:18px; padding:20px;}
+    .card{border-radius:18px;}
+    .stat-card{padding:18px; border-radius:18px;}
+    .hero{padding:24px 18px;}
+    .table-surface table{min-width:640px;}
+    main{padding-bottom:28px;}
+  }
 </style>
 </head>
 <body>
@@ -295,8 +450,11 @@ $adminsList = $pdo->query("SELECT id, username FROM admins ORDER BY username ASC
     </div>
   </div>
   <nav class="mt-3 space-y-2">
-    <a href="#overview" class="flex items-center gap-3 px-3 py-2 rounded-lg hover:bg-white/5">
-      <i class="fa-solid fa-chart-simple"></i> نظرة عامة
+    <a href="#insights" class="flex items-center gap-3 px-3 py-2 rounded-lg hover:bg-white/5">
+      <i class="fa-solid fa-chart-simple"></i> الإحصائيات
+    </a>
+    <a href="#clients" class="flex items-center gap-3 px-3 py-2 rounded-lg hover:bg-white/5">
+      <i class="fa-solid fa-users"></i> العملاء
     </a>
     <a href="#otp" class="flex items-center gap-3 px-3 py-2 rounded-lg hover:bg-white/5">
       <i class="fa-solid fa-shield"></i> تتبّع الأكواد
@@ -319,97 +477,226 @@ $adminsList = $pdo->query("SELECT id, username FROM admins ORDER BY username ASC
   </div>
 </aside>
 
+<!-- MOBILE HEADER -->
+<header class="md:hidden sticky top-0 z-30 bg-[#111827] text-white px-4 py-4 flex items-center justify-between">
+  <div>
+    <div class="text-xs text-gray-300">مرحباً</div>
+    <div class="font-semibold text-lg"><?= htmlspecialchars($superAdminUsername) ?></div>
+  </div>
+  <div class="text-xs text-gray-300 text-right">
+    <div><?= date('Y-m-d') ?></div>
+    <div><?= date('H:i') ?></div>
+  </div>
+</header>
+
 <!-- MAIN -->
-<main class="md:pr-80 p-4 md:p-8 space-y-8">
+<main class="md:pr-80 p-4 md:p-8 space-y-10 pt-20 md:pt-8 max-w-7xl mx-auto">
 
-  <!-- TOP BAR -->
-  <section class="panel soft round p-4 flex items-center justify-between gap-3">
-    <div class="flex items-center gap-3">
-      <div class="text-2xl font-bold">Analytics</div>
-      <div class="chip pill px-3 py-1 text-sm text-gray-600">facebook.com/companyname</div>
-    </div>
-    <div class="flex items-center gap-3">
-      <div class="chip pill px-3 py-1 text-sm text-gray-500 hidden sm:block">بحث</div>
-      <a href="?export=otp&from=<?= urlencode($filter_from) ?>&to=<?= urlencode($filter_to) ?><?= $filter_admin!==null ? '&admin_id='.$filter_admin : '' ?>" class="pill px-4 py-2 bg-black text-white">تصدير OTP</a>
+  <section class="panel hero soft round p-6 lg:p-8">
+    <div class="grid gap-6 lg:grid-cols-[1.6fr,1fr] items-center relative">
+      <div class="space-y-4 relative z-10">
+        <span class="badge-soft"><i class="fa-solid fa-gauge-high text-sm"></i> لوحة التحكم المتقدمة</span>
+        <h1 class="text-2xl sm:text-3xl md:text-4xl font-bold text-gray-900 leading-tight">كل ما تحتاجه لإدارة المنصة في صفحة واحدة</h1>
+        <p class="text-gray-600 leading-relaxed">راقب أداء العملاء، فعالية المشرفين، وسجلات OTP من واجهة واحدة أنيقة. تم تصميم هذه اللوحة لتوفر لك السرعة في اتخاذ القرار والوضوح في البيانات.</p>
+        <div class="flex flex-wrap gap-3">
+          <a href="#admins" class="pill px-5 py-2 bg-black text-white flex items-center gap-2">
+            <i class="fa-solid fa-users-gear text-sm"></i>
+            إدارة المشرفين
+          </a>
+          <a href="?<?= htmlspecialchars(buildQuery($_GET, ['export' => 'otp'], ['otp_page'])) ?>" class="action-btn primary">
+            <i class="fa-solid fa-file-arrow-down text-sm"></i>
+            تصدير OTP
+          </a>
+        </div>
+      </div>
+      <div class="glass round p-6 space-y-4 text-sm text-gray-600 relative z-10">
+        <div class="flex items-center justify-between">
+          <span class="font-semibold text-gray-800">لوحة الحالة</span>
+          <span class="badge-soft"><i class="fa-regular fa-clock"></i> <?= date('Y-m-d H:i') ?></span>
+        </div>
+        <div class="space-y-3">
+          <div>
+            <div class="text-xs text-gray-500">آخر عميل تم تسجيله</div>
+            <div class="flex items-center justify-between gap-2 text-gray-800">
+              <span class="font-semibold"><?= htmlspecialchars($recentClients[0]['username'] ?? '—') ?></span>
+              <span class="text-xs text-gray-500"><?= $recentClients ? formatRelativeTime($recentClients[0]['created_at'] ?? null) : '—' ?></span>
+            </div>
+          </div>
+          <div>
+            <div class="text-xs text-gray-500">أبرز مشرف اليوم</div>
+            <div class="flex items-center justify-between gap-2 text-gray-800">
+              <span class="font-semibold"><?= htmlspecialchars($topSupervisorName) ?></span>
+              <span class="text-xs text-gray-500"><?= number_format($topSupervisorClients) ?> عملاء</span>
+            </div>
+          </div>
+          <?php if ($expiry_date): ?>
+          <div class="p-4 rounded-xl border border-white/60 bg-white/40 flex items-center justify-between gap-3">
+            <div>
+              <div class="text-xs text-gray-500">اشتراك النظام</div>
+              <div class="font-semibold <?= $isSubscriptionExpired ? 'text-rose-600' : 'text-emerald-600' ?>">
+                <?= $isSubscriptionExpired ? 'منتهي منذ ' : 'صالح حتى ' ?>
+                <?= htmlspecialchars(date('Y-m-d', strtotime($expiry_date))) ?>
+              </div>
+            </div>
+            <i class="fa-regular fa-calendar-check text-xl <?= $isSubscriptionExpired ? 'text-rose-500' : 'text-emerald-500' ?>"></i>
+          </div>
+          <?php endif; ?>
+          <?php if ($latestOtp): ?>
+          <div class="p-4 rounded-xl border border-white/60 bg-white/60 space-y-2">
+            <div class="text-xs text-gray-500">آخر عملية OTP</div>
+            <div class="flex items-start justify-between gap-3">
+              <div>
+                <div class="text-sm font-semibold text-gray-800">كود: <code><?= htmlspecialchars($latestOtp['code']) ?></code></div>
+                <div class="text-xs text-gray-500 mt-1"><?= formatRelativeTime($latestOtp['created_at'] ?? null) ?></div>
+              </div>
+              <div class="text-right text-xs text-gray-500 space-y-1">
+                <div><?= $latestOtp['client_name'] ? htmlspecialchars($latestOtp['client_name']) : ($latestOtp['client_id'] ? 'عميل #'.(int)$latestOtp['client_id'] : '—') ?></div>
+                <div><?= $latestOtp['admin_name'] ? htmlspecialchars($latestOtp['admin_name']) : ($latestOtp['admin_id'] ? 'مشرف #'.(int)$latestOtp['admin_id'] : '—') ?></div>
+              </div>
+            </div>
+          </div>
+          <?php endif; ?>
+        </div>
+      </div>
     </div>
   </section>
 
-  <!-- OVERVIEW GRID -->
-  <section id="overview" class="grid grid-cols-1 lg:grid-cols-3 gap-6">
-    <!-- Gradient Big Card -->
-    <div class="gradA round soft p-6 text-white relative">
-      <div class="text-sm opacity-80 mb-2">إجمالي طلبات OTP (الفترة)</div>
-      <div class="text-4xl font-bold"><?= number_format($otpTotalInRange) ?></div>
-      <div class="mt-6 text-xs opacity-90 grid grid-cols-3 gap-2">
-        <div class="chip pill px-3 py-1 bg-white/15 border-white/20">مشرفون: <?= count($otpTopAdmins) ?></div>
-        <div class="chip pill px-3 py-1 bg-white/15 border-white/20">عملاء فريدون: <?= $otpUniqueClients ?></div>
-        <div class="chip pill px-3 py-1 bg-white/15 border-white/20">اليوم: <?= $clientsToday ?></div>
+  <section id="insights" class="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-5">
+    <div class="stat-card">
+      <div class="flex items-center justify-between">
+        <div class="stat-icon gradA text-white"><i class="fa-solid fa-users"></i></div>
+        <span class="badge-soft"><i class="fa-regular fa-user"></i> اليوم <?= number_format($clientsToday) ?></span>
       </div>
-      <div class="absolute -bottom-6 -left-6 w-24 h-24 round gradB opacity-70 blur-sm"></div>
+      <div class="stat-value"><?= shortNumber($totalClients) ?></div>
+      <div class="text-sm text-gray-500">عميل ضمن النظام</div>
     </div>
-
-    <!-- Donut / Top admin share -->
-    <div class="panel round soft p-6">
-      <div class="flex items-center justify-between mb-3">
-        <div class="font-semibold">حصة أعلى مشرف</div>
+    <div class="stat-card">
+      <div class="flex items-center justify-between">
+        <div class="stat-icon gradB text-white"><i class="fa-solid fa-user-shield"></i></div>
+        <span class="badge-soft"><i class="fa-solid fa-toggle-on"></i> نشطون <?= number_format($activeAdmins) ?></span>
       </div>
-      <div class="flex items-center gap-6">
-        <canvas id="donut" width="140" height="140"></canvas>
-        <div>
-          <div class="text-3xl font-bold"><?= $topShare ?>%</div>
-          <div class="text-sm muted">المشرف: <b><?= htmlspecialchars($topAdminName) ?></b></div>
-          <div class="text-xs mt-1 text-gray-500">عدد طلباته: <?= $topAdminCount ?></div>
-        </div>
-      </div>
+      <div class="stat-value"><?= shortNumber($totalAdmins) ?></div>
+      <div class="text-sm text-gray-500">مشرف مسجّل</div>
     </div>
-
-    <!-- Comments / counters card -->
-    <div class="panel round soft p-6">
-      <div class="font-semibold mb-3">ملخص سريع</div>
-      <div class="grid grid-cols-2 gap-3">
-        <div class="chip pill px-3 py-3">
-          <div class="text-xs muted">الإيميلات المرتبطة</div>
-          <div class="text-xl font-bold"><?= $totalEmails ?></div>
-        </div>
-        <div class="chip pill px-3 py-3">
-          <div class="text-xs muted">المشرفون النشطون</div>
-          <div class="text-xl font-bold"><?= $activeAdmins ?></div>
-        </div>
-        <div class="chip pill px-3 py-3">
-          <div class="text-xs muted">عدد العملاء</div>
-          <div class="text-xl font-bold"><?= $totalClients ?></div>
-        </div>
-        <div class="chip pill px-3 py-3">
-          <div class="text-xs muted">الإيميلات اليوم</div>
-          <div class="text-xl font-bold"><?= $emailsToday ?></div>
-        </div>
+    <div class="stat-card">
+      <div class="flex items-center justify-between">
+        <div class="stat-icon bg-black text-white"><i class="fa-regular fa-envelope"></i></div>
+        <span class="badge-soft"><i class="fa-solid fa-bolt"></i> اليوم <?= number_format($emailsToday) ?></span>
       </div>
+      <div class="stat-value"><?= shortNumber($totalEmails) ?></div>
+      <div class="text-sm text-gray-500">رسالة مرتبطة بالحملات</div>
+    </div>
+    <div class="stat-card">
+      <div class="flex items-center justify-between">
+        <div class="stat-icon bg-emerald-500 text-white"><i class="fa-solid fa-shield-halved"></i></div>
+        <span class="badge-soft"><i class="fa-solid fa-chart-line"></i> متوسط <?= $otpDailyAverage ?></span>
+      </div>
+      <div class="stat-value"><?= shortNumber($otpTotalInRange) ?></div>
+      <div class="text-sm text-gray-500">طلبات OTP خلال الفترة</div>
     </div>
   </section>
 
-  <!-- CHARTS + QUICK LIST -->
   <section class="grid grid-cols-1 xl:grid-cols-3 gap-6">
-    <div class="xl:col-span-2 panel round soft p-6">
-      <div class="flex items-center justify-between mb-3">
-        <div class="font-semibold">Post Stats / OTP آخر 14 يوم</div>
+    <div class="xl:col-span-2 panel round soft p-6 space-y-4">
+      <div class="flex items-center justify-between">
+        <h3 class="font-semibold text-lg">توجهات OTP (آخر 14 يوم)</h3>
+        <span class="badge-soft"><i class="fa-solid fa-arrow-trend-up"></i> متوسط <?= $otpDailyAverage ?></span>
       </div>
-      <canvas id="chartDays"></canvas>
+      <canvas id="chartDays" height="260"></canvas>
     </div>
-    <div class="panel round soft p-6">
-      <div class="flex items-center justify-between mb-3">
-        <div class="font-semibold">أفضل 10 مشرفين</div>
+    <div class="flex flex-col gap-4">
+      <div class="panel round soft p-6 space-y-4">
+        <div class="flex items-center justify-between">
+          <h3 class="font-semibold text-lg">حصة أعلى مشرف</h3>
+          <span class="badge-soft"><i class="fa-solid fa-crown"></i> <?= htmlspecialchars($topAdminName) ?></span>
+        </div>
+        <div class="flex items-center gap-6">
+          <canvas id="donut" width="140" height="140"></canvas>
+          <div class="space-y-2">
+            <div class="text-4xl font-bold"><?= $topShare ?>%</div>
+            <div class="text-sm text-gray-500">عدد الطلبات: <?= number_format($topAdminCount) ?></div>
+            <div class="text-xs text-gray-400">إجمالي الفترة: <?= number_format($otpTotalInRange) ?></div>
+          </div>
+        </div>
       </div>
-      <canvas id="chartAdmins"></canvas>
+      <div class="panel round soft p-6 space-y-3">
+        <div class="flex items-center justify-between">
+          <h3 class="font-semibold text-lg">أفضل 10 مشرفين (OTP)</h3>
+          <span class="badge-soft"><i class="fa-solid fa-ranking-star"></i></span>
+        </div>
+        <canvas id="chartAdmins" height="180"></canvas>
+      </div>
     </div>
   </section>
 
-  <!-- FILTERS -->
-  <section id="otp" class="panel round soft p-6 space-y-4">
-    <div class="flex items-center justify-between">
-      <h3 class="font-semibold text-lg">تتبّع الأكواد</h3>
-      <div class="text-sm muted">آخر تحديث: <?= date('H:i') ?></div>
+  <section id="clients" class="grid grid-cols-1 xl:grid-cols-3 gap-6">
+    <div class="xl:col-span-2 panel round soft p-6">
+      <div class="flex items-center justify-between mb-4">
+        <div>
+          <h3 class="font-semibold text-lg">أحدث العملاء</h3>
+          <p class="text-sm text-gray-500">تابع العملاء المنضمّين مؤخراً إلى المنصة.</p>
+        </div>
+        <span class="badge-soft"><i class="fa-solid fa-database"></i> إجمالي <?= shortNumber($totalClients) ?></span>
+      </div>
+      <?php if (!empty($recentClients)): ?>
+        <div>
+          <?php foreach ($recentClients as $client): ?>
+            <?php
+              $clientName = $client['username'] ? htmlspecialchars($client['username']) : 'عميل #'.(int)$client['id'];
+              $clientOwner = $client['admin_name'] ? htmlspecialchars($client['admin_name']) : 'غير محدد';
+            ?>
+            <div class="list-tile">
+              <div>
+                <div class="font-semibold text-gray-800"><?= $clientName ?></div>
+                <div class="text-xs text-gray-500">المشرف: <?= $clientOwner ?></div>
+              </div>
+              <div class="text-xs text-gray-500 flex flex-col items-end">
+                <span><?= formatRelativeTime($client['created_at'] ?? null) ?></span>
+                <span class="text-[10px] text-gray-400">#<?= (int)$client['id'] ?></span>
+              </div>
+            </div>
+          <?php endforeach; ?>
+        </div>
+      <?php else: ?>
+        <div class="text-sm text-gray-500 text-center py-6">لا يوجد عملاء جدد في هذه الفترة.</div>
+      <?php endif; ?>
     </div>
-    <form method="GET" class="grid md:grid-cols-4 gap-3">
+    <div class="panel round soft p-6 space-y-4">
+      <div class="flex items-center justify-between">
+        <h3 class="font-semibold text-lg">قادة المشرفين</h3>
+        <span class="badge-soft"><i class="fa-solid fa-chart-pie"></i> العملاء</span>
+      </div>
+      <div class="space-y-4">
+        <?php if (!empty($topClientLeaders)): ?>
+          <?php foreach ($topClientLeaders as $leader): ?>
+            <?php $percentage = $totalClients > 0 ? min(100, round(($leader['total_clients'] / $totalClients) * 100)) : 0; ?>
+            <div>
+              <div class="flex items-center justify-between text-sm">
+                <span class="font-semibold text-gray-800"><?= $leader['username'] ? htmlspecialchars($leader['username']) : '—' ?></span>
+                <span class="text-gray-500"><?= number_format($leader['total_clients']) ?> عملاء</span>
+              </div>
+              <div class="mt-2 h-2 rounded-full bg-gray-200 overflow-hidden">
+                <div class="h-full gradB" style="width: <?= $percentage ?>%"></div>
+              </div>
+            </div>
+          <?php endforeach; ?>
+        <?php else: ?>
+          <div class="text-sm text-gray-500 text-center py-6">لا يوجد بيانات لعرضها حالياً.</div>
+        <?php endif; ?>
+      </div>
+    </div>
+  </section>
+
+  <section id="otp" class="panel round soft p-6 space-y-6">
+    <div class="flex items-start justify-between gap-4 flex-wrap">
+      <div>
+        <h3 class="font-semibold text-lg">تتبّع الأكواد (OTP)</h3>
+        <p class="text-sm text-gray-500">رشّح الفترات وتابع الأداء التفصيلي لجميع المشرفين.</p>
+      </div>
+      <span class="badge-soft"><i class="fa-regular fa-clock"></i> آخر تحديث <?= date('H:i') ?></span>
+    </div>
+    <form method="GET" class="grid gap-3 md:grid-cols-5">
+      <input type="hidden" name="range" id="rangeInput" value="<?= htmlspecialchars($filter_range) ?>">
       <div>
         <label class="text-xs muted mb-1 block">من</label>
         <input type="date" name="from" value="<?= htmlspecialchars($filter_from) ?>" class="w-full chip px-3 py-2 round">
@@ -423,26 +710,42 @@ $adminsList = $pdo->query("SELECT id, username FROM admins ORDER BY username ASC
         <select name="admin_id" class="w-full chip px-3 py-2 round">
           <option value="">الكل</option>
           <?php foreach ($adminsList as $a): ?>
-            <option value="<?= (int)$a['id'] ?>" <?= $filter_admin===(int)$a['id']?'selected':'' ?>>
-              <?= htmlspecialchars($a['username']) ?>
-            </option>
+            <option value="<?= (int)$a['id'] ?>" <?= $filter_admin===(int)$a['id']?'selected':'' ?>><?= htmlspecialchars($a['username']) ?></option>
           <?php endforeach; ?>
         </select>
       </div>
       <div class="flex items-end">
         <button class="w-full pill px-4 py-2 bg-black text-white">تطبيق</button>
       </div>
+      <div class="flex items-end">
+        <a href="?<?= htmlspecialchars(buildQuery($_GET, ['export' => 'otp'], ['otp_page'])) ?>" class="w-full pill px-4 py-2 bg-white text-gray-700 border border-gray-200 text-center">تحميل CSV</a>
+      </div>
+      <div class="md:col-span-5 flex flex-wrap gap-2 items-center text-xs text-gray-500">
+        <span class="muted">نطاق سريع:</span>
+        <?php
+          $rangeOptions = [
+            'today' => 'اليوم',
+            '7d'    => 'آخر 7 أيام',
+            '30d'   => 'آخر 30 يوماً',
+            'month' => 'بداية الشهر'
+          ];
+        ?>
+        <?php foreach ($rangeOptions as $value => $label): ?>
+          <button type="button" class="chip px-3 py-1 round quick-range <?= $filter_range === $value ? 'bg-black text-white border-black' : '' ?>" data-range="<?= $value ?>">
+            <?= $label ?>
+          </button>
+        <?php endforeach; ?>
+        <button type="button" class="chip px-3 py-1 round <?= $filter_range === 'custom' ? 'bg-black text-white border-black' : '' ?>" id="customRangeBtn">مخصص</button>
+      </div>
     </form>
-
-    <!-- Quick KPIs -->
     <div class="grid grid-cols-2 md:grid-cols-4 gap-3">
       <div class="chip px-4 py-4 round">
         <div class="text-xs muted">إجمالي الطلبات</div>
-        <div class="text-2xl font-bold"><?= $otpTotalInRange ?></div>
+        <div class="text-2xl font-bold"><?= number_format($otpTotalInRange) ?></div>
       </div>
       <div class="chip px-4 py-4 round">
         <div class="text-xs muted">عملاء فريدون</div>
-        <div class="text-2xl font-bold"><?= $otpUniqueClients ?></div>
+        <div class="text-2xl font-bold"><?= number_format($otpUniqueClients) ?></div>
       </div>
       <div class="chip px-4 py-4 round">
         <div class="text-xs muted">أعلى مشرف</div>
@@ -453,126 +756,262 @@ $adminsList = $pdo->query("SELECT id, username FROM admins ORDER BY username ASC
         <div class="text-2xl font-bold"><?= $topShare ?>%</div>
       </div>
     </div>
-
-    <!-- Recent Table -->
-    <div class="mt-2">
-      <div class="flex items-center justify-between mb-3">
-        <div class="font-semibold">آخر 100 عملية</div>
+    <div class="table-surface overflow-x-auto">
+      <div class="flex items-center justify-between px-4 py-3">
+        <div class="text-sm text-gray-600">
+          <?php if ($otpTotalInRange > 0): ?>
+            عرض <?= number_format($otpShowingFrom) ?>-<?= number_format($otpShowingTo) ?> من <?= number_format($otpTotalInRange) ?>
+          <?php else: ?>
+            لا توجد نتائج للعرض
+          <?php endif; ?>
+        </div>
         <input id="otpSearch" class="chip round px-3 py-2 w-60" placeholder="بحث سريع...">
       </div>
-      <div class="overflow-x-auto">
-        <table class="w-full text-sm">
-          <thead class="border-b" style="border-color:var(--hair)">
-            <tr class="text-gray-500">
-              <th class="text-right py-2">#</th>
-              <th class="text-right py-2">العميل</th>
-              <th class="text-right py-2">المشرف</th>
-              <th class="text-right py-2">الكود/الهاش</th>
-              <th class="text-right py-2">الوقت</th>
-            </tr>
-          </thead>
-          <tbody id="otpTableBody">
+      <table>
+        <thead>
+          <tr>
+            <th>#</th>
+            <th>العميل</th>
+            <th>المشرف</th>
+            <th>الكود / الهاش</th>
+            <th>التاريخ</th>
+            <th>منذ</th>
+          </tr>
+        </thead>
+        <tbody id="otpTableBody">
+          <?php if (!empty($otpRecent)): ?>
             <?php foreach ($otpRecent as $r): ?>
-              <tr class="border-b hover:bg-gray-50" style="border-color:var(--hair)">
-                <td class="py-2"><?= (int)$r['id'] ?></td>
-                <td class="py-2">
-                  <?= $r['client_name'] ? htmlspecialchars($r['client_name']).' <span class="text-xs muted">#'.$r['client_id'].'</span>' : '—' ?>
+              <?php
+                $clientName = $r['client_name'] ? htmlspecialchars($r['client_name']) : ($r['client_id'] ? 'عميل #'.(int)$r['client_id'] : '—');
+                $clientRef = $r['client_id'] ? '#'.(int)$r['client_id'] : '';
+                $adminName = $r['admin_name'] ? htmlspecialchars($r['admin_name']) : ($r['admin_id'] ? 'مشرف #'.(int)$r['admin_id'] : '—');
+                $adminRef = $r['admin_id'] ? '#'.(int)$r['admin_id'] : '';
+              ?>
+              <tr class="hover:bg-gray-50">
+                <td><?= (int)$r['id'] ?></td>
+                <td>
+                  <div class="font-medium text-gray-800"><?= $clientName ?></div>
+                  <?php if ($clientRef): ?><div class="text-xs text-gray-400"><?= $clientRef ?></div><?php endif; ?>
                 </td>
-                <td class="py-2">
-                  <?= $r['admin_name'] ? htmlspecialchars($r['admin_name']).' <span class="text-xs muted">#'.$r['admin_id'].'</span>' : '—' ?>
+                <td>
+                  <div class="font-medium text-gray-800"><?= $adminName ?></div>
+                  <?php if ($adminRef): ?><div class="text-xs text-gray-400"><?= $adminRef ?></div><?php endif; ?>
                 </td>
-                <td class="py-2"><code class="text-xs"><?= htmlspecialchars($r['code']) ?></code></td>
-                <td class="py-2"><?= htmlspecialchars($r['created_at']) ?></td>
+                <td><code class="text-xs"><?= htmlspecialchars($r['code']) ?></code></td>
+                <td><?= htmlspecialchars($r['created_at']) ?></td>
+                <td><?= formatRelativeTime($r['created_at'] ?? null) ?></td>
               </tr>
             <?php endforeach; ?>
-            <?php if (empty($otpRecent)): ?>
-              <tr><td colspan="5" class="py-6 text-center muted">لا توجد سجلات.</td></tr>
-            <?php endif; ?>
-          </tbody>
-        </table>
-      </div>
+          <?php else: ?>
+            <tr>
+              <td colspan="6" class="text-center py-6 text-gray-500">لا توجد سجلات مطابقة للمعايير الحالية.</td>
+            </tr>
+          <?php endif; ?>
+        </tbody>
+      </table>
     </div>
+    <?php if ($otpPages > 1): ?>
+      <?php $otpWindowStart = max(1, $otpPage - 2); $otpWindowEnd = min($otpPages, $otpPage + 2); ?>
+      <div class="flex flex-wrap items-center justify-between gap-3 text-sm text-gray-600">
+        <div>صفحة <?= number_format($otpPage) ?> من <?= number_format($otpPages) ?></div>
+        <div class="flex items-center gap-2">
+          <?php if ($otpPage > 1): ?>
+            <a class="chip px-3 py-1 round" href="?<?= htmlspecialchars(buildQuery($_GET, ['otp_page' => $otpPage - 1], ['export'])) ?>">السابق</a>
+          <?php endif; ?>
+          <?php for ($p = $otpWindowStart; $p <= $otpWindowEnd; $p++): ?>
+            <a class="chip px-3 py-1 round <?= $p === $otpPage ? 'bg-black text-white border-black' : '' ?>" href="?<?= htmlspecialchars(buildQuery($_GET, ['otp_page' => $p], ['export'])) ?>"><?= number_format($p) ?></a>
+          <?php endfor; ?>
+          <?php if ($otpPage < $otpPages): ?>
+            <a class="chip px-3 py-1 round" href="?<?= htmlspecialchars(buildQuery($_GET, ['otp_page' => $otpPage + 1], ['export'])) ?>">التالي</a>
+          <?php endif; ?>
+        </div>
+      </div>
+    <?php endif; ?>
   </section>
 
-  <!-- Admins Management -->
-  <section id="admins" class="panel round soft p-6 space-y-6">
-    <div class="flex items-center justify-between">
-      <h3 class="font-semibold text-lg">إدارة المشرفين</h3>
-    </div>
-
-    <?php if ($success): ?>
-      <div class="round px-4 py-3 bg-emerald-50 text-emerald-700 border border-emerald-200"><?= htmlspecialchars($success) ?></div>
-    <?php endif; ?>
-    <?php if ($error): ?>
-      <div class="round px-4 py-3 bg-rose-50 text-rose-700 border border-rose-200"><?= htmlspecialchars($error) ?></div>
-    <?php endif; ?>
-
-    <form method="POST" class="grid md:grid-cols-3 gap-3">
-      <input type="hidden" name="csrf_token" value="<?= htmlspecialchars($_SESSION['csrf_token'], ENT_QUOTES, 'UTF-8') ?>">
-      <input type="text" name="username" placeholder="اسم المستخدم" required class="chip round px-3 py-2">
-      <input type="password" name="password" placeholder="كلمة المرور" required class="chip round px-3 py-2">
-      <input type="date" name="expiry_date" class="chip round px-3 py-2">
-      <div class="md:col-span-3">
-        <button type="submit" name="add_admin" class="pill px-5 py-2 bg-black text-white">إضافة مشرف</button>
-      </div>
-    </form>
-
-    <div class="grid md:grid-cols-2 xl:grid-cols-3 gap-4">
-      <?php foreach ($supervisors as $admin):
-        $statusText = 'مشترك'; $badge='border-emerald-200 text-emerald-700 bg-emerald-50';
-        if (!empty($admin['expiry_date'])) {
-          $exp=strtotime($admin['expiry_date']); $now=time(); $days=($exp-$now)/86400;
-          if ($exp < $now) { $statusText='منتهي'; $badge='border-rose-200 text-rose-700 bg-rose-50'; }
-          elseif ($days <= 7) { $statusText='قريب الانتهاء'; $badge='border-amber-200 text-amber-700 bg-amber-50'; }
-        }
-      ?>
-      <div class="card round soft p-4">
-        <div class="flex items-center justify-between mb-2">
-          <div class="font-semibold"><?= htmlspecialchars($admin['username']) ?></div>
-          <span class="px-3 py-1 text-xs rounded-full border <?= $badge ?>"><?= $statusText ?></span>
+  <section id="admins" class="space-y-6">
+    <div class="panel round soft p-6 space-y-6">
+      <div class="flex items-center justify-between">
+        <div>
+          <h3 class="font-semibold text-lg">إدارة المشرفين</h3>
+          <p class="text-sm text-gray-500">إنشئ حسابات جديدة، عدّل الصلاحيات، وتابع حالة الاشتراكات بسهولة.</p>
         </div>
-        <div class="text-xs muted">الإيميلات: <?= (int)$admin['emailCount'] ?> • العملاء: <?= (int)$admin['clientCount'] ?> • الحالة: <?= $admin['is_active']?'نشط':'موقوف' ?></div>
-        <div class="text-xs muted mt-1">الانتهاء: <?= htmlspecialchars($admin['expiry_date'] ?? 'غير محدد') ?></div>
-        <div class="flex flex-wrap gap-2 mt-3">
-          <?php if ((int)$admin['id'] !== (int)$_SESSION['super_admin_id']): ?>
-            <button class="chip round px-3 py-1 edit-admin"
-              data-id="<?= (int)$admin['id'] ?>"
-              data-username="<?= htmlspecialchars($admin['username'], ENT_QUOTES, 'UTF-8') ?>"
-              data-expiry="<?= htmlspecialchars($admin['expiry_date'] ?? '', ENT_QUOTES, 'UTF-8') ?>">
-              تعديل
+        <a href="#admin-create" class="badge-soft"><i class="fa-solid fa-plus"></i> مشرف جديد</a>
+      </div>
+      <?php if ($success): ?>
+        <div class="round px-4 py-3 bg-emerald-50 text-emerald-700 border border-emerald-200"><?= htmlspecialchars($success) ?></div>
+      <?php endif; ?>
+      <?php if ($error): ?>
+        <div class="round px-4 py-3 bg-rose-50 text-rose-700 border border-rose-200"><?= htmlspecialchars($error) ?></div>
+      <?php endif; ?>
+      <div class="grid gap-6 lg:grid-cols-[minmax(0,1fr),minmax(0,2fr)]">
+        <div id="admin-create" class="card round soft p-5 space-y-4">
+          <div>
+            <h4 class="font-semibold text-base">إنشاء مشرف جديد</h4>
+            <p class="text-xs text-gray-500">أدخل بيانات المشرف الجديد لتمنحه صلاحية الوصول إلى النظام.</p>
+          </div>
+          <form method="POST" class="space-y-3">
+            <input type="hidden" name="csrf_token" value="<?= htmlspecialchars($_SESSION['csrf_token'], ENT_QUOTES, 'UTF-8') ?>">
+            <input type="hidden" name="admin_page" value="<?= $currentAdminPage ?>">
+            <div class="space-y-1">
+              <label class="text-xs muted">اسم المستخدم</label>
+              <input type="text" name="username" placeholder="اسم المستخدم" required class="chip round px-3 py-2 w-full">
+            </div>
+            <div class="space-y-1">
+              <label class="text-xs muted">كلمة المرور</label>
+              <input type="password" name="password" placeholder="كلمة المرور" required class="chip round px-3 py-2 w-full">
+            </div>
+            <div class="space-y-1">
+              <label class="text-xs muted">تاريخ الانتهاء</label>
+              <input type="date" name="expiry_date" class="chip round px-3 py-2 w-full">
+            </div>
+            <button type="submit" name="add_admin" class="pill px-5 py-2 bg-black text-white w-full flex items-center justify-center gap-2">
+              <i class="fa-solid fa-user-plus"></i>
+              إضافة مشرف
             </button>
-            <form method="POST" onsubmit="return confirm('تأكيد الحذف؟')">
-              <input type="hidden" name="admin_id" value="<?= (int)$admin['id'] ?>">
-              <input type="hidden" name="csrf_token" value="<?= htmlspecialchars($_SESSION['csrf_token'], ENT_QUOTES, 'UTF-8') ?>">
-              <button type="submit" name="delete_admin" class="chip round px-3 py-1">حذف</button>
-            </form>
-            <form method="POST">
-              <input type="hidden" name="admin_id" value="<?= (int)$admin['id'] ?>">
-              <input type="hidden" name="is_active" value="<?= $admin['is_active']?0:1 ?>">
-              <input type="hidden" name="csrf_token" value="<?= htmlspecialchars($_SESSION['csrf_token'], ENT_QUOTES, 'UTF-8') ?>">
-              <button type="submit" name="toggle_status" class="chip round px-3 py-1">
-                <?= $admin['is_active']?'إيقاف':'تنشيط' ?>
-              </button>
-            </form>
-          <?php else: ?>
-            <span class="text-xs muted">لا يمكن تعديل حسابك</span>
-          <?php endif; ?>
-          <a href="admin_details.php?admin_id=<?= (int)$admin['id'] ?>" class="pill px-3 py-1 bg-black text-white">تفاصيل</a>
+          </form>
+        </div>
+        <div class="table-surface card round soft p-0 overflow-hidden">
+          <div class="flex items-center justify-between px-4 py-3 border-b border-gray-100 text-sm text-gray-600">
+            <div>
+              <?php if ($totalAdminsCount > 0): ?>
+                عرض <?= number_format($adminShowingFrom) ?>-<?= number_format($adminShowingTo) ?> من <?= number_format($totalAdminsCount) ?> مشرف
+              <?php else: ?>
+                لا يوجد مشرفون بعد
+              <?php endif; ?>
+            </div>
+            <div class="hidden sm:block text-xs text-gray-400">صفحة <?= number_format($currentAdminPage) ?> من <?= number_format($adminPages) ?></div>
+          </div>
+          <table>
+            <thead>
+              <tr>
+                <th>المشرف</th>
+                <th>العملاء</th>
+                <th>الإيميلات</th>
+                <th>الحالة</th>
+                <th>الإجراءات</th>
+              </tr>
+            </thead>
+            <tbody>
+              <?php if (!empty($supervisors)): ?>
+                <?php foreach ($supervisors as $admin):
+                  $statusText = 'مشترك';
+                  $badge = 'badge-soft border border-emerald-200 text-emerald-700 bg-emerald-50';
+                  if (!empty($admin['expiry_date'])) {
+                      $exp = strtotime($admin['expiry_date']);
+                      $now = time();
+                      $days = ($exp - $now) / 86400;
+                      if ($exp < $now) {
+                          $statusText = 'منتهي';
+                          $badge = 'badge-soft border border-rose-200 text-rose-700 bg-rose-50';
+                      } elseif ($days <= 7) {
+                          $statusText = 'قريب الانتهاء';
+                          $badge = 'badge-soft border border-amber-200 text-amber-700 bg-amber-50';
+                      }
+                  }
+                ?>
+                <tr class="hover:bg-gray-50" data-admin-row="<?= (int)$admin['id'] ?>">
+                  <td>
+                    <div class="flex flex-col gap-1">
+                      <div class="flex items-center gap-2 flex-wrap">
+                        <span class="font-semibold text-gray-800 admin-username"><?= htmlspecialchars($admin['username']) ?></span>
+                        <span class="<?= $badge ?> text-xs px-3 py-1"><?= $statusText ?></span>
+                      </div>
+                      <span class="text-xs text-gray-500 admin-expiry">الانتهاء: <?= htmlspecialchars($admin['expiry_date'] ?? 'غير محدد') ?></span>
+                    </div>
+                  </td>
+                  <td class="text-center font-semibold text-gray-800"><?= number_format((int)$admin['clientCount']) ?></td>
+                  <td class="text-center font-semibold text-gray-800"><?= number_format((int)$admin['emailCount']) ?></td>
+                  <td class="text-center">
+                    <span class="badge-soft <?= $admin['is_active'] ? 'bg-emerald-50 text-emerald-600 border border-emerald-200' : 'bg-rose-50 text-rose-600 border border-rose-200' ?>">
+                      <?= $admin['is_active'] ? 'نشط' : 'موقوف' ?>
+                    </span>
+                  </td>
+                  <td>
+                    <?php if ((int)$admin['id'] !== (int)$_SESSION['super_admin_id']): ?>
+                      <div class="table-actions">
+                        <button type="button" class="action-btn edit-admin"
+                          data-id="<?= (int)$admin['id'] ?>"
+                          data-username="<?= htmlspecialchars($admin['username'], ENT_QUOTES, 'UTF-8') ?>"
+                          data-expiry="<?= htmlspecialchars($admin['expiry_date'] ?? '', ENT_QUOTES, 'UTF-8') ?>">
+                          <i class="fa-regular fa-pen-to-square"></i>
+                          تعديل
+                        </button>
+                        <form method="POST" onsubmit="return confirm('تأكيد الحذف؟')">
+                          <input type="hidden" name="admin_id" value="<?= (int)$admin['id'] ?>">
+                          <input type="hidden" name="csrf_token" value="<?= htmlspecialchars($_SESSION['csrf_token'], ENT_QUOTES, 'UTF-8') ?>">
+                          <input type="hidden" name="admin_page" value="<?= $currentAdminPage ?>">
+                          <button type="submit" name="delete_admin" class="action-btn">
+                            <i class="fa-regular fa-trash-can"></i>
+                            حذف
+                          </button>
+                        </form>
+                        <form method="POST">
+                          <input type="hidden" name="admin_id" value="<?= (int)$admin['id'] ?>">
+                          <input type="hidden" name="is_active" value="<?= $admin['is_active']?0:1 ?>">
+                          <input type="hidden" name="csrf_token" value="<?= htmlspecialchars($_SESSION['csrf_token'], ENT_QUOTES, 'UTF-8') ?>">
+                          <input type="hidden" name="admin_page" value="<?= $currentAdminPage ?>">
+                          <button type="submit" name="toggle_status" class="action-btn">
+                            <i class="fa-solid fa-power-off"></i>
+                            <?= $admin['is_active']?'إيقاف':'تنشيط' ?>
+                          </button>
+                        </form>
+                        <a href="admin_details.php?admin_id=<?= (int)$admin['id'] ?>" class="action-btn primary">
+                          <i class="fa-solid fa-arrow-up-right-from-square"></i>
+                          تفاصيل
+                        </a>
+                      </div>
+                    <?php else: ?>
+                      <span class="text-xs text-gray-400">هذا هو حسابك الحالي.</span>
+                    <?php endif; ?>
+                  </td>
+                </tr>
+                <?php endforeach; ?>
+              <?php else: ?>
+                <tr>
+                  <td colspan="5" class="text-center py-6 text-gray-500">لا يوجد مشرفون مسجّلون بعد.</td>
+                </tr>
+              <?php endif; ?>
+            </tbody>
+          </table>
         </div>
       </div>
-      <?php endforeach; ?>
+      <?php if ($adminPages > 1): ?>
+        <?php $adminWindowStart = max(1, $currentAdminPage - 2); $adminWindowEnd = min($adminPages, $currentAdminPage + 2); ?>
+        <div class="flex flex-wrap items-center justify-between gap-3 text-sm text-gray-600">
+          <div>صفحة <?= number_format($currentAdminPage) ?> من <?= number_format($adminPages) ?></div>
+          <div class="flex items-center gap-2">
+            <?php if ($currentAdminPage > 1): ?>
+              <a class="chip px-3 py-1 round" href="?<?= htmlspecialchars(buildQuery($_GET, ['admin_page' => $currentAdminPage - 1], ['export'])) ?>#admins">السابق</a>
+            <?php endif; ?>
+            <?php for ($p = $adminWindowStart; $p <= $adminWindowEnd; $p++): ?>
+              <a class="chip px-3 py-1 round <?= $p === $currentAdminPage ? 'bg-black text-white border-black' : '' ?>" href="?<?= htmlspecialchars(buildQuery($_GET, ['admin_page' => $p], ['export'])) ?>#admins"><?= number_format($p) ?></a>
+            <?php endfor; ?>
+            <?php if ($currentAdminPage < $adminPages): ?>
+              <a class="chip px-3 py-1 round" href="?<?= htmlspecialchars(buildQuery($_GET, ['admin_page' => $currentAdminPage + 1], ['export'])) ?>#admins">التالي</a>
+            <?php endif; ?>
+          </div>
+        </div>
+      <?php endif; ?>
     </div>
   </section>
 
   <!-- MODAL: Edit -->
   <div id="editAdminModal" class="fixed inset-0 hidden items-center justify-center bg-black/40 z-50">
-    <div class="panel round p-6 w-[92%] max-w-md">
+    <div class="panel round soft p-6 w-[92%] max-w-md">
       <div class="font-semibold mb-3">تعديل المشرف</div>
       <form id="editAdminForm" class="space-y-3">
         <input type="hidden" name="admin_id" id="editAdminId">
         <input type="hidden" name="csrf_token" value="<?= htmlspecialchars($_SESSION['csrf_token'], ENT_QUOTES, 'UTF-8') ?>">
-        <input type="text" name="username" id="editUsername" required class="chip round px-3 py-2" placeholder="اسم المستخدم">
-        <input type="date" name="expiry_date" id="editExpiryDate" class="chip round px-3 py-2">
+        <div class="space-y-1">
+          <label class="text-xs muted" for="editUsername">اسم المستخدم</label>
+          <input type="text" name="username" id="editUsername" required class="chip round px-3 py-2 w-full" placeholder="اسم المستخدم">
+        </div>
+        <div class="space-y-1">
+          <label class="text-xs muted" for="editExpiryDate">تاريخ الانتهاء</label>
+          <input type="date" name="expiry_date" id="editExpiryDate" class="chip round px-3 py-2 w-full">
+        </div>
+        <div id="editFeedback" class="hidden text-xs"></div>
         <div class="flex justify-end gap-2">
           <button type="button" id="closeModal" class="chip round px-4 py-2">إلغاء</button>
           <button type="submit" name="edit_admin" class="pill px-4 py-2 bg-black text-white">حفظ</button>
@@ -590,16 +1029,70 @@ $adminsList = $pdo->query("SELECT id, username FROM admins ORDER BY username ASC
   // Modal
   const modal = document.getElementById('editAdminModal');
   const closeModalBtn = document.getElementById('closeModal');
+  const editForm = document.getElementById('editAdminForm');
+  const editFeedback = document.getElementById('editFeedback');
   document.querySelectorAll('.edit-admin').forEach(btn=>{
     btn.addEventListener('click',()=>{
       document.getElementById('editAdminId').value = btn.dataset.id;
       document.getElementById('editUsername').value = btn.dataset.username || '';
       document.getElementById('editExpiryDate').value = btn.dataset.expiry || '';
+      if(editFeedback){ editFeedback.className = 'hidden text-xs'; editFeedback.textContent=''; }
       modal.classList.remove('hidden'); modal.classList.add('flex');
     });
   });
   closeModalBtn && closeModalBtn.addEventListener('click',()=>{ modal.classList.add('hidden'); modal.classList.remove('flex'); });
   modal && modal.addEventListener('click',(e)=>{ if(e.target===modal){ closeModalBtn.click(); } });
+
+  editForm?.addEventListener('submit', async (event)=>{
+    event.preventDefault();
+    const formData = new FormData(editForm);
+    formData.append('edit_admin', '1');
+    const submitBtn = editForm.querySelector('button[type="submit"]');
+    const originalText = submitBtn?.innerHTML;
+    if(submitBtn){ submitBtn.disabled = true; submitBtn.textContent = 'جاري الحفظ...'; }
+    if(editFeedback){ editFeedback.className = 'hidden text-xs'; editFeedback.textContent=''; }
+    let responseData = null;
+    try {
+      const response = await fetch(window.location.href, { method:'POST', body: formData });
+      const contentType = response.headers.get('content-type') || '';
+      if (contentType.includes('application/json')) {
+        responseData = await response.json();
+      }
+      if (!response.ok) {
+        throw new Error('request-failed');
+      }
+    } catch (err) {
+      responseData = responseData || { status: 'error', message: 'حدث خطأ غير متوقع. حاول مجدداً.' };
+    }
+    const username = (editForm.querySelector('#editUsername')?.value || '').trim();
+    const expiryValue = editForm.querySelector('#editExpiryDate')?.value || '';
+    const adminId = formData.get('admin_id');
+    if(responseData?.status === 'success'){
+      if(editFeedback){
+        editFeedback.className = 'block text-xs mt-2 px-3 py-2 round bg-emerald-50 text-emerald-700 border border-emerald-200';
+        editFeedback.textContent = responseData.message || 'تم الحفظ بنجاح.';
+      }
+      const targetRow = document.querySelector(`[data-admin-row="${adminId}"]`);
+      if(targetRow){
+        const usernameCell = targetRow.querySelector('.admin-username');
+        const expiryCell = targetRow.querySelector('.admin-expiry');
+        if(usernameCell){ usernameCell.textContent = username; }
+        if(expiryCell){ expiryCell.textContent = 'الانتهاء: ' + (expiryValue || 'غير محدد'); }
+      }
+      const triggerBtn = document.querySelector(`.edit-admin[data-id="${adminId}"]`);
+      if(triggerBtn){
+        triggerBtn.dataset.username = username;
+        triggerBtn.dataset.expiry = expiryValue;
+      }
+      setTimeout(()=>{ closeModalBtn?.click(); }, 900);
+    } else {
+      if(editFeedback){
+        editFeedback.className = 'block text-xs mt-2 px-3 py-2 round bg-rose-50 text-rose-700 border border-rose-200';
+        editFeedback.textContent = responseData?.message || 'تعذر حفظ التغييرات.';
+      }
+    }
+    if(submitBtn){ submitBtn.disabled = false; submitBtn.innerHTML = originalText || 'حفظ'; }
+  });
 
   // Table search
   const otpSearch = document.getElementById('otpSearch');
@@ -610,6 +1103,54 @@ $adminsList = $pdo->query("SELECT id, username FROM admins ORDER BY username ASC
       const text = tr.innerText.toLowerCase();
       tr.style.display = text.includes(q) ? '' : 'none';
     });
+  });
+
+  // Quick date ranges
+  const rangeInput = document.getElementById('rangeInput');
+  const fromInput = document.querySelector('input[name="from"]');
+  const toInput = document.querySelector('input[name="to"]');
+  const quickRangeButtons = document.querySelectorAll('.quick-range');
+  const customRangeBtn = document.getElementById('customRangeBtn');
+  const formatDateValue = (date)=>{
+    const year = date.getFullYear();
+    const month = String(date.getMonth() + 1).padStart(2,'0');
+    const day = String(date.getDate()).padStart(2,'0');
+    return `${year}-${month}-${day}`;
+  };
+  quickRangeButtons.forEach(btn=>{
+    btn.addEventListener('click', ()=>{
+      const range = btn.dataset.range || 'today';
+      const form = btn.closest('form');
+      const baseDate = toInput?.value ? new Date(`${toInput.value}T00:00:00`) : new Date();
+      let startDate = new Date(baseDate);
+      switch(range){
+        case '7d':
+          startDate.setDate(startDate.getDate() - 6);
+          break;
+        case '30d':
+          startDate.setDate(startDate.getDate() - 29);
+          break;
+        case 'month':
+          startDate = new Date(baseDate.getFullYear(), baseDate.getMonth(), 1);
+          break;
+        default:
+          startDate = new Date(baseDate.getFullYear(), baseDate.getMonth(), baseDate.getDate());
+      }
+      if(fromInput){ fromInput.value = formatDateValue(startDate); }
+      if(toInput){ toInput.value = formatDateValue(baseDate); }
+      if(rangeInput){ rangeInput.value = range; }
+      if(form){
+        if(typeof form.requestSubmit === 'function'){
+          form.requestSubmit();
+        } else {
+          form.submit();
+        }
+      }
+    });
+  });
+  customRangeBtn?.addEventListener('click', ()=>{ if(rangeInput){ rangeInput.value = 'custom'; } });
+  [fromInput, toInput].forEach(el=>{
+    el?.addEventListener('change', ()=>{ if(rangeInput){ rangeInput.value = 'custom'; } });
   });
 
   // Charts
